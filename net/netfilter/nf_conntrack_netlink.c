@@ -271,6 +271,24 @@ ctnetlink_dump_counters(struct sk_buff *skb, const struct nf_conn *ct,
 }
 
 static int
+ctnetlink_filter_counters(const struct nf_conn *ct)
+{
+	struct nf_conn_counter *acct;
+
+	acct = nf_conn_acct_find(ct);
+
+    if (acct && 
+        (atomic64_read(&acct[0].packets) > 0 ||
+        atomic64_read(&acct[0].bytes) > 0 ||
+        atomic64_read(&acct[1].packets) > 0 ||
+        atomic64_read(&acct[1].bytes) > 0)) {
+        return 0;
+    }
+
+    return -1;
+}
+
+static int
 ctnetlink_dump_timestamp(struct sk_buff *skb, const struct nf_conn *ct)
 {
 	struct nlattr *nest_count;
@@ -372,9 +390,28 @@ ctnetlink_dump_labels(struct sk_buff *skb, const struct nf_conn *ct)
 
 	return 0;
 }
+
+static int
+has_label_flowlog(const struct nf_conn *ct)
+{
+#define LABEL_FLOWLOG 0x0000000000000001
+
+	struct nf_conn_labels *labels = nf_ct_labels_find(ct);
+	if (!labels)
+		return 0;
+
+    if (labels->bits[0] & LABEL_FLOWLOG) {
+	    //printk(KERN_ERR "JIHO: Enabled Flowlog(0x%lx) \n", labels->bits[0]);
+        return 1;
+    }
+
+    return 0;
+}
+
 #else
 #define ctnetlink_dump_labels(a, b) (0)
 #define ctnetlink_label_size(a)	(0)
+#define has_label_flowlog(a)	(0)
 #endif
 
 #define master_tuple(ct) &(ct->master->tuplehash[IP_CT_DIR_ORIGINAL].tuple)
@@ -538,6 +575,78 @@ nla_put_failure:
 	return -1;
 }
 
+// Joyent: simple CT info
+static int
+ctnetlink_fill_simple_info(struct sk_buff *skb, u32 portid, u32 seq, u32 type, struct nf_conn *ct)
+{
+	const struct nf_conntrack_zone *zone;
+	struct nlmsghdr *nlh;
+	struct nfgenmsg *nfmsg;
+	struct nlattr *nest_parms;
+	unsigned int flags = portid ? NLM_F_MULTI : 0, event;
+
+	event = (NFNL_SUBSYS_CTNETLINK << 8 | IPCTNL_MSG_CT_NEW);
+	nlh = nlmsg_put(skb, portid, seq, event, sizeof(*nfmsg), flags);
+	if (nlh == NULL)
+		goto nlmsg_failure;
+
+	nfmsg = nlmsg_data(nlh);
+	nfmsg->nfgen_family = nf_ct_l3num(ct);
+	nfmsg->version      = NFNETLINK_V0;
+	nfmsg->res_id	    = 0;
+
+	zone = nf_ct_zone(ct);
+
+	nest_parms = nla_nest_start(skb, CTA_TUPLE_ORIG | NLA_F_NESTED);
+	if (!nest_parms)
+		goto nla_put_failure;
+	if (ctnetlink_dump_tuples(skb, nf_ct_tuple(ct, IP_CT_DIR_ORIGINAL)) < 0)
+		goto nla_put_failure;
+	if (ctnetlink_dump_zone_id(skb, CTA_TUPLE_ZONE, zone,
+				   NF_CT_ZONE_DIR_ORIG) < 0)
+		goto nla_put_failure;
+	nla_nest_end(skb, nest_parms);
+
+	nest_parms = nla_nest_start(skb, CTA_TUPLE_REPLY | NLA_F_NESTED);
+	if (!nest_parms)
+		goto nla_put_failure;
+	if (ctnetlink_dump_tuples(skb, nf_ct_tuple(ct, IP_CT_DIR_REPLY)) < 0)
+		goto nla_put_failure;
+	if (ctnetlink_dump_zone_id(skb, CTA_TUPLE_ZONE, zone,
+				   NF_CT_ZONE_DIR_REPL) < 0)
+		goto nla_put_failure;
+	nla_nest_end(skb, nest_parms);
+
+	if (ctnetlink_dump_zone_id(skb, CTA_ZONE, zone,
+				   NF_CT_DEFAULT_ZONE_DIR) < 0)
+		goto nla_put_failure;
+
+	if (ctnetlink_dump_status(skb, ct) < 0 ||
+	    ctnetlink_dump_timeout(skb, ct) < 0 ||
+	    ctnetlink_dump_counters(skb, ct, IP_CT_DIR_ORIGINAL, type) < 0 ||
+	    ctnetlink_dump_counters(skb, ct, IP_CT_DIR_REPLY, type) < 0 ||
+	    ctnetlink_dump_timestamp(skb, ct) < 0 ||
+	    ctnetlink_dump_protoinfo(skb, ct) < 0 ||
+	    //ctnetlink_dump_helpinfo(skb, ct) < 0 ||
+	    ctnetlink_dump_mark(skb, ct) < 0 ||
+	    //ctnetlink_dump_secctx(skb, ct) < 0 ||
+	    ctnetlink_dump_labels(skb, ct) < 0 ||
+	    ctnetlink_dump_id(skb, ct) < 0 ||
+	    ctnetlink_dump_use(skb, ct) < 0 ||
+	    ctnetlink_dump_master(skb, ct) < 0)
+	    //ctnetlink_dump_master(skb, ct) < 0 ||
+	    //ctnetlink_dump_ct_seq_adj(skb, ct) < 0)
+		goto nla_put_failure;
+
+	nlmsg_end(skb, nlh);
+	return skb->len;
+
+nlmsg_failure:
+nla_put_failure:
+	nlmsg_cancel(skb, nlh);
+	return -1;
+}
+
 static inline size_t
 ctnetlink_proto_size(const struct nf_conn *ct)
 {
@@ -610,12 +719,12 @@ ctnetlink_nlmsg_size(const struct nf_conn *ct)
 	       + ctnetlink_timestamp_size(ct)
 	       + nla_total_size(sizeof(u_int32_t)) /* CTA_TIMEOUT */
 	       + nla_total_size(0) /* CTA_PROTOINFO */
-	       + nla_total_size(0) /* CTA_HELP */
-	       + nla_total_size(NF_CT_HELPER_NAME_LEN) /* CTA_HELP_NAME */
-	       + ctnetlink_secctx_size(ct)
+	       //+ nla_total_size(0) /* CTA_HELP */
+	       //+ nla_total_size(NF_CT_HELPER_NAME_LEN) /* CTA_HELP_NAME */
+	       //+ ctnetlink_secctx_size(ct)
 #ifdef CONFIG_NF_NAT_NEEDED
-	       + 2 * nla_total_size(0) /* CTA_NAT_SEQ_ADJ_ORIG|REPL */
-	       + 6 * nla_total_size(sizeof(u_int32_t)) /* CTA_NAT_SEQ_OFFSET */
+	       //+ 2 * nla_total_size(0) /* CTA_NAT_SEQ_ADJ_ORIG|REPL */
+	       //+ 6 * nla_total_size(sizeof(u_int32_t)) /* CTA_NAT_SEQ_OFFSET */
 #endif
 #ifdef CONFIG_NF_CONNTRACK_MARK
 	       + nla_total_size(sizeof(u_int32_t)) /* CTA_MARK */
@@ -664,6 +773,11 @@ ctnetlink_conntrack_event(unsigned int events, struct nf_ct_event *item)
 	if (!item->report && !nfnetlink_has_listeners(net, group))
 		return 0;
 
+    // jiho: filter it by Label value
+    if (!has_label_flowlog(ct)) {
+        return 0;
+    }
+    
 	skb = nlmsg_new(ctnetlink_nlmsg_size(ct), GFP_ATOMIC);
 	if (skb == NULL)
 		goto errout;
@@ -711,14 +825,26 @@ ctnetlink_conntrack_event(unsigned int events, struct nf_ct_event *item)
 	if (ctnetlink_dump_status(skb, ct) < 0)
 		goto nla_put_failure;
 
-	if (events & (1 << IPCT_DESTROY)) {
+    // modified by jiho
+	if (false && events & (1 << IPCT_DESTROY)) {
 		if (ctnetlink_dump_counters(skb, ct,
 					    IP_CT_DIR_ORIGINAL, type) < 0 ||
 		    ctnetlink_dump_counters(skb, ct,
 					    IP_CT_DIR_REPLY, type) < 0 ||
 		    ctnetlink_dump_timestamp(skb, ct) < 0)
 			goto nla_put_failure;
+
 	} else {
+        // added by jiho
+	    if (events & (1 << IPCT_DESTROY)) {
+            if (ctnetlink_dump_counters(skb, ct,
+                            IP_CT_DIR_ORIGINAL, type) < 0 ||
+                ctnetlink_dump_counters(skb, ct,
+                            IP_CT_DIR_REPLY, type) < 0 ||
+                ctnetlink_dump_timestamp(skb, ct) < 0)
+                goto nla_put_failure;
+        }
+
 		if (ctnetlink_dump_timeout(skb, ct) < 0)
 			goto nla_put_failure;
 
@@ -726,6 +852,7 @@ ctnetlink_conntrack_event(unsigned int events, struct nf_ct_event *item)
 		    && ctnetlink_dump_protoinfo(skb, ct) < 0)
 			goto nla_put_failure;
 
+        /*
 		if ((events & (1 << IPCT_HELPER) || nfct_help(ct))
 		    && ctnetlink_dump_helpinfo(skb, ct) < 0)
 			goto nla_put_failure;
@@ -735,10 +862,13 @@ ctnetlink_conntrack_event(unsigned int events, struct nf_ct_event *item)
 		    && ctnetlink_dump_secctx(skb, ct) < 0)
 			goto nla_put_failure;
 #endif
-		if (events & (1 << IPCT_LABEL) &&
+        */
+
+		if (/*events & (1 << IPCT_LABEL) &&*/
 		     ctnetlink_dump_labels(skb, ct) < 0)
 			goto nla_put_failure;
 
+        /*
 		if (events & (1 << IPCT_RELATED) &&
 		    ctnetlink_dump_master(skb, ct) < 0)
 			goto nla_put_failure;
@@ -746,6 +876,7 @@ ctnetlink_conntrack_event(unsigned int events, struct nf_ct_event *item)
 		if (events & (1 << IPCT_SEQADJ) &&
 		    ctnetlink_dump_ct_seq_adj(skb, ct) < 0)
 			goto nla_put_failure;
+        */
 	}
 
 #ifdef CONFIG_NF_CONNTRACK_MARK
@@ -840,13 +971,29 @@ restart:
 				continue;
 			}
 #endif
-			rcu_read_lock();
-			res =
-			ctnetlink_fill_info(skb, NETLINK_CB(cb->skb).portid,
-					    cb->nlh->nlmsg_seq,
-					    NFNL_MSG_TYPE(cb->nlh->nlmsg_type),
-					    ct);
-			rcu_read_unlock();
+
+            // Joyent: filter it out if no packet
+	        if (NFNL_MSG_TYPE(cb->nlh->nlmsg_type) == IPCTNL_MSG_CT_GET_CTRZERO) {
+                if (ctnetlink_filter_counters(ct) < 0) {
+                    continue;
+                }
+
+                rcu_read_lock();
+
+                res = ctnetlink_fill_simple_info(skb, NETLINK_CB(cb->skb).portid,
+                            cb->nlh->nlmsg_seq, NFNL_MSG_TYPE(cb->nlh->nlmsg_type), ct);
+
+                rcu_read_unlock();
+            } else {
+                rcu_read_lock();
+                res =
+                ctnetlink_fill_info(skb, NETLINK_CB(cb->skb).portid,
+                            cb->nlh->nlmsg_seq,
+                            NFNL_MSG_TYPE(cb->nlh->nlmsg_type),
+                            ct);
+                rcu_read_unlock();
+            }
+
 			if (res < 0) {
 				nf_conntrack_get(&ct->ct_general);
 				cb->args[1] = (unsigned long)ct;
